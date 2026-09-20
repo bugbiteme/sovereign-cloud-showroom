@@ -149,10 +149,12 @@ You should see `python-hi-314:3.14-builder AS build`, then `USER root`, then `py
 podman build --tls-verify=false -t $QUAY_URL/$QUAY_USER/patient-portal-frontend:1.0 .
 ----
 
-. Push the image to Quay, then pull it back. Cosign signs what is *in the registry*, not a local tag. `NAME_UNKNOWN: repository not found` on `cosign tree` or `cosign sign` means this push did not land:
+. Log in, push the image to Quay, then pull it back. Cosign signs what is *in the registry*, not a local tag. `unauthorized` means Podman is not logged in to this Quay (Cosign login is a different credential file). `NAME_UNKNOWN: repository not found` later means this push did not land:
 +
 [source,sh,subs="attributes",role=execute]
 ----
+source ~/.bashrc
+podman login https://$QUAY_URL -u $QUAY_USER -p {quay_admin_password} --tls-verify=false
 podman push --tls-verify=false $QUAY_URL/$QUAY_USER/patient-portal-frontend:1.0
 podman pull --tls-verify=false $QUAY_URL/$QUAY_USER/patient-portal-frontend:1.0
 podman images | grep patient-portal-frontend
@@ -311,6 +313,8 @@ https://docs.docker.com/go/credential-store/
 
 logged in via /home/lab-user/.docker/config.json
 ----
++
+That `WARNING! Your credentials are stored unencrypted` line is expected. Cosign has no credential helper on the bastion.
 
 . Confirm the image is in Quay. You want “No Supply Chain Security Related Artifacts” — that means the image exists and is unsigned. `NAME_UNKNOWN: repository not found` means go back and push:
 +
@@ -325,36 +329,22 @@ cosign tree --allow-insecure-registry $QUAY_URL/$QUAY_USER/patient-portal-fronte
 [lab-user@bastion ~]$ cosign tree --allow-insecure-registry $QUAY_URL/$QUAY_USER/patient-portal-frontend:1.0
 📦 Supply Chain Security Related artifacts for an image: quay.apps.cluster-m2mgb.dyn.redhatworkshops.io/quayadmin/patient-portal-frontend:1.0
 No Supply Chain Security Related Artifacts artifacts found for image quay.apps.cluster-m2mgb.dyn.redhatworkshops.io/quayadmin/patient-portal-frontend:1.0
-, start creating one with simply running$ cosign sign <img>
 ----
 
-. Resolve the *digest* of the image you just pushed. A tag such as `:1.0` is a pointer that can be moved to a different image later. A digest (`@sha256:...`) is the immutable checksum of that exact image:
+. Resolve the image digest, then sign *that*. After `cosign initialize`, Cosign loads Fulcio and Rekor from the TUF signing config. The env block above also exported those service URLs, and Cosign refuses both at once (`cannot specify service URLs and use signing config`). `--use-signing-config=false` keeps the URLs you already set. `--new-bundle-format=false` keeps the classic `.sig` tag that `cosign tree` shows next. Sign the digest, not `:1.0` — a tag can be moved later; `@sha256:...` cannot:
 +
 [source,sh,subs="attributes",role=execute]
 ----
 IMAGE=$QUAY_URL/$QUAY_USER/patient-portal-frontend:1.0
 DIGEST=$(podman inspect --format '{{index .RepoDigests 0}}' "$IMAGE")
 echo "$DIGEST"
-----
-+
-[.console-output]
-[source,bash,subs="+macros,+attributes"]
-----
-[lab-user@bastion ~]$ echo "$DIGEST"
-quay.apps.<your-cluster>.<domain>/quayadmin/patient-portal-frontend@sha256:...
-----
-+
-[IMPORTANT]
-====
-*Sign the digest, not the tag.* If you sign `:1.0`, you attest to whichever image that tag happens to point at when Cosign resolves it. Someone can later retag a different (unsigned or malicious) image as `:1.0`, and consumers who pull by tag will no longer be looking at the bits you signed. Signing `@sha256:...` binds the signature to one immutable artifact. Cosign warns when you pass a tag, and a future release will refuse tags entirely.
-====
-
-. Sign that digest. After `cosign initialize`, newer Cosign loads Fulcio and Rekor from the TUF `signing_config`. This lab still sets those service URLs (and the Keycloak OIDC issuer) in the environment, which Cosign treats as a conflict unless you turn the signing config off. `--new-bundle-format=false` keeps the classic `.sig` tag that `cosign tree` shows next:
-+
-[source,sh,subs="attributes",role=execute]
-----
 cosign sign --allow-insecure-registry --use-signing-config=false --new-bundle-format=false "$DIGEST"
 ----
++
+[CAUTION]
+====
+`cosign sign $QUAY_URL/$QUAY_USER/patient-portal-frontend:1.0` fails with `cannot specify service URLs and use signing config`. It also signs a movable tag. Use the command above.
+====
 +
 [.console-output]
 [source,bash,subs="+macros,+attributes"]
