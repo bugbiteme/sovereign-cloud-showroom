@@ -149,11 +149,13 @@ You should see `python-hi-314:3.14-builder AS build`, then `USER root`, then `py
 podman build --tls-verify=false -t $QUAY_URL/$QUAY_USER/patient-portal-frontend:1.0 .
 ----
 
-. Push the image to your Quay instance:
+. Push the image to Quay, then pull it back. Cosign signs what is *in the registry*, not a local tag. `NAME_UNKNOWN: repository not found` on `cosign tree` or `cosign sign` means this push did not land:
 +
 [source,sh,subs="attributes",role=execute]
 ----
 podman push --tls-verify=false $QUAY_URL/$QUAY_USER/patient-portal-frontend:1.0
+podman pull --tls-verify=false $QUAY_URL/$QUAY_USER/patient-portal-frontend:1.0
+podman images | grep patient-portal-frontend
 ----
 
 [[signing-your-software]]
@@ -262,58 +264,29 @@ echo "OIDC_ISSUER_URL=$OIDC_ISSUER_URL"
 env | grep URL
 ----
 +
-. As the last step, initialize `cosign` against your in-cluster TUF root. Cosign requires a checksum when that initial `root.json` is fetched over HTTPS, so you pin the file before trusting the URL:
+. As the last step, initialize `cosign` against your in-cluster TUF root. Cosign requires a checksum when that initial `root.json` is fetched over HTTPS, so you pin the file before trusting the URL. Current Cosign prints *nothing* on success (older builds dumped a `Root status` JSON). The checksum and `~/.sigstore` are the proof:
 +
 [source,sh,subs="attributes",role=execute]
 ----
 export ROOT_CHECKSUM=$(curl -fsSL "$TUF_URL/root.json" | sha256sum | awk '{print $1}')
 echo "$ROOT_CHECKSUM"
 cosign initialize --mirror "$TUF_URL" --root "$TUF_URL/root.json" --root-checksum "$ROOT_CHECKSUM"
+echo "initialize exit=$?  TUF metadata:"
+ls -la ~/.sigstore
 ----
 +
 [.console-output]
 [source,bash,subs="+macros,+attributes"]
 ----
-[lab-user@bastion ~]$ export ROOT_CHECKSUM=$(curl -fsSL "$TUF_URL/root.json" | sha256sum | awk '{print $1}')
 [lab-user@bastion ~]$ echo "$ROOT_CHECKSUM"
-a1b2c3d4e5f6...
+<sha256 of this cluster's TUF root.json>
 [lab-user@bastion ~]$ cosign initialize --mirror "$TUF_URL" --root "$TUF_URL/root.json" --root-checksum "$ROOT_CHECKSUM"
-Root status: 
- {
-        "local": "/home/lab-user/.sigstore/root",
-        "remote": "https://tuf-trusted-artifact-signer.apps.cluster-l2ktc.l2ktc.sandbox75.opentlc.com",
-        "metadata": {
-                "root.json": {
-                        "version": 1,
-                        "len": 2178,
-                        "expiration": "13 Jun 25 16:39 UTC",
-                        "error": ""
-                },
-                "snapshot.json": {
-                        "version": 1,
-                        "len": 618,
-                        "expiration": "13 Jun 25 16:39 UTC",
-                        "error": ""
-                },
-                "targets.json": {
-                        "version": 1,
-                        "len": 1372,
-                        "expiration": "13 Jun 25 16:39 UTC",
-                        "error": ""
-                },
-                "timestamp.json": {
-                        "version": 1,
-                        "len": 619,
-                        "expiration": "13 Jun 25 16:39 UTC",
-                        "error": ""
-                }
-        },
-        "targets": [
-                "ctfe.pub",
-                "fulcio_v1.crt.pem",
-                "rekor.pub"
-        ]
-}
+[lab-user@bastion ~]$ echo "initialize exit=$?  TUF metadata:"
+initialize exit=0  TUF metadata:
+total 12
+drwxr-xr-x.  3 lab-user lab-user   18 ... .sigstore
+drwx------. 18 lab-user lab-user 4096 ... .
+drwxr-xr-x.  3 lab-user lab-user   18 ... root
 ----
 
 Cryptographic signing lets you control which container images can run in your environment, making sure only trusted, verified images are used. You already verified Red Hat's signature on the Hardened Image *base*. This step binds *your* identity to the application image you built on that base.
@@ -339,17 +312,17 @@ https://docs.docker.com/go/credential-store/
 logged in via /home/lab-user/.docker/config.json
 ----
 
-. Run the following command in the terminal:
+. Confirm the image is in Quay. You want “No Supply Chain Security Related Artifacts” — that means the image exists and is unsigned. `NAME_UNKNOWN: repository not found` means go back and push:
 +
 [source,sh,subs="attributes",role=execute]
 ----
-cosign tree $QUAY_URL/$QUAY_USER/patient-portal-frontend:1.0
+cosign tree --allow-insecure-registry $QUAY_URL/$QUAY_USER/patient-portal-frontend:1.0
 ----
 +
 [.console-output]
 [source,bash,subs="+macros,+attributes"]
 ----
-[lab-user@bastion ~]$ cosign tree $QUAY_URL/$QUAY_USER/patient-portal-frontend:1.0
+[lab-user@bastion ~]$ cosign tree --allow-insecure-registry $QUAY_URL/$QUAY_USER/patient-portal-frontend:1.0
 📦 Supply Chain Security Related artifacts for an image: quay.apps.cluster-m2mgb.dyn.redhatworkshops.io/quayadmin/patient-portal-frontend:1.0
 No Supply Chain Security Related Artifacts artifacts found for image quay.apps.cluster-m2mgb.dyn.redhatworkshops.io/quayadmin/patient-portal-frontend:1.0
 , start creating one with simply running$ cosign sign <img>
@@ -380,13 +353,13 @@ quay.apps.<your-cluster>.<domain>/quayadmin/patient-portal-frontend@sha256:...
 +
 [source,sh,subs="attributes",role=execute]
 ----
-cosign sign --use-signing-config=false --new-bundle-format=false "$DIGEST"
+cosign sign --allow-insecure-registry --use-signing-config=false --new-bundle-format=false "$DIGEST"
 ----
 +
 [.console-output]
 [source,bash,subs="+macros,+attributes"]
 ----
-[lab-user@bastion ~]$ cosign sign --use-signing-config=false --new-bundle-format=false "$DIGEST"
+[lab-user@bastion ~]$ cosign sign --allow-insecure-registry --use-signing-config=false --new-bundle-format=false "$DIGEST"
 Generating ephemeral keys...
 Retrieving signed certificate...
 
@@ -440,7 +413,7 @@ You have signed a specific image digest in the Quay registry, not a movable tag.
 +
 [source,sh,subs="attributes",role=execute]
 ----
-cosign tree $QUAY_URL/$QUAY_USER/patient-portal-frontend:1.0
+cosign tree --allow-insecure-registry $QUAY_URL/$QUAY_USER/patient-portal-frontend:1.0
 ----
 +
 [.console-output]
