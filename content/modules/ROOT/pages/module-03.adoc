@@ -149,7 +149,7 @@ You should see `python-hi-314:3.14-builder AS build`, then `USER root`, then `py
 podman build --tls-verify=false -t $QUAY_URL/$QUAY_USER/patient-portal-frontend:1.0 .
 ----
 
-. Log in, push the image to Quay, then pull it back. Cosign signs what is *in the registry*, not a local tag. `unauthorized` means Podman is not logged in to this Quay (Cosign login is a different credential file). `NAME_UNKNOWN: repository not found` later means this push did not land:
+. Log in, push the image to Quay, then pull it back. Cosign signs what is *in the registry*, not a local tag. `NAME_UNKNOWN: repository not found` later means this push did not land:
 +
 [source,sh,subs="attributes",role=execute]
 ----
@@ -159,6 +159,8 @@ podman push --tls-verify=false $QUAY_URL/$QUAY_USER/patient-portal-frontend:1.0
 podman pull --tls-verify=false $QUAY_URL/$QUAY_USER/patient-portal-frontend:1.0
 podman images | grep patient-portal-frontend
 ----
++
+NOTE: If `podman push` fails with `unauthorized: access to the requested resource is not authorized`, the earlier `podman login` likely timed out or expired while the image was building. Re-run `podman login` from the command above, then retry `podman push`. You do not need to rebuild or retag. Cosign uses a different credential file, so a successful Cosign login does not replace `podman login`.
 
 [[signing-your-software]]
 
