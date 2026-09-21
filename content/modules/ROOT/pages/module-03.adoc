@@ -264,18 +264,22 @@ export REKOR_REKOR_SERVER=$COSIGN_REKOR_URL
 echo "TUF_URL=$TUF_URL"
 echo "OIDC_ISSUER_URL=$OIDC_ISSUER_URL"
 env | grep URL
-----
-+
-. As the last step, initialize `cosign` against your in-cluster TUF root. Cosign requires a checksum when that initial `root.json` is fetched over HTTPS, so you pin the file before trusting the URL. Current Cosign prints *nothing* on success (older builds dumped a `Root status` JSON). The checksum and `~/.sigstore` are the proof:
-+
-[source,sh,subs="attributes",role=execute]
-----
+
+# Pin TUF root.json before trusting the HTTPS URL. Do not run bare `cosign initialize`:
+# COSIGN_ROOT is a URL, so Cosign warns and (in a later release) will refuse.
 export ROOT_CHECKSUM=$(curl -fsSL "$TUF_URL/root.json" | sha256sum | awk '{print $1}')
 echo "$ROOT_CHECKSUM"
 cosign initialize --mirror "$TUF_URL" --root "$TUF_URL/root.json" --root-checksum "$ROOT_CHECKSUM"
 echo "initialize exit=$?  TUF metadata:"
 ls -la ~/.sigstore
 ----
++
+[CAUTION]
+====
+`cosign initialize` with no flags prints `Fetching initial root from URL without providing its checksum is deprecated`. That is not this step. Use `--mirror`, `--root`, and `--root-checksum` as in the block above.
+====
++
+Current Cosign prints *nothing* on a successful initialize (older builds dumped a `Root status` JSON). The checksum and `~/.sigstore` are the proof:
 +
 [.console-output]
 [source,bash,subs="+macros,+attributes"]
