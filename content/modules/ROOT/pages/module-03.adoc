@@ -203,8 +203,8 @@ Platform:      linux/amd64
 [source,sh,subs="attributes",role=execute]
 ----
 source ~/.bashrc
+
 if [ -f ~/svc-lab/tssc-setup/cosign-env.sh ]; then
-  # shellcheck disable=SC1091
   source ~/svc-lab/tssc-setup/cosign-env.sh
 fi
 

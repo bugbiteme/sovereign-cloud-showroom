@@ -1142,26 +1142,56 @@ approve_rhtas_installplan_if_needed() {
     fi
 }
 
-# OLM can leave CSV in Installing long after the operator Deployment/Pods are actually ready.
-rhtas_operator_controller_ready() {
-    local dep ready want n
-    n=$(oc get pods -n openshift-operators -l name=trusted-artifact-signer-operator --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d ' ' || echo 0)
-    if [ "${n:-0}" -ge 1 ]; then
-        ready=$(oc get pods -n openshift-operators -l name=trusted-artifact-signer-operator -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.ready}{"\n"}{end}{end}' 2>/dev/null | grep -c true || echo 0)
-        if [ "${ready:-0}" -ge 1 ]; then
-            return 0
-        fi
+# Securesign v1alpha1 is converted by the operator webhook. A pod in Running
+# phase with no ready addresses (CSV still InstallReady) is not enough.
+rhtas_webhook_service_ready() {
+    local strategy ns name addrs ready_flags
+    if ! oc get crd securesigns.rhtas.redhat.com >/dev/null 2>&1; then
+        return 1
     fi
-    if oc get pods -n openshift-operators --no-headers 2>/dev/null | awk '$3=="Running"' | grep -qiE 'trusted-artifact-signer|rhtas'; then
+    strategy=$(oc get crd securesigns.rhtas.redhat.com -o jsonpath='{.spec.conversion.strategy}' 2>/dev/null || true)
+    if [ "$strategy" != "Webhook" ]; then
         return 0
     fi
-    dep=$(oc get deployment -n openshift-operators -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep -iE 'trusted-artifact-signer|rhtas' | head -1)
-    if [ -n "$dep" ]; then
-        ready=$(oc get deployment "$dep" -n openshift-operators -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
-        want=$(oc get deployment "$dep" -n openshift-operators -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 1)
-        if [ -n "${ready:-}" ] && [ "${want:-1}" != "0" ] && [ "$ready" = "$want" ]; then
+    ns=$(oc get crd securesigns.rhtas.redhat.com -o jsonpath='{.spec.conversion.webhook.clientConfig.service.namespace}' 2>/dev/null || true)
+    name=$(oc get crd securesigns.rhtas.redhat.com -o jsonpath='{.spec.conversion.webhook.clientConfig.service.name}' 2>/dev/null || true)
+    if [ -z "$ns" ] || [ -z "$name" ]; then
+        return 1
+    fi
+    addrs=$(oc get endpoints "$name" -n "$ns" -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)
+    if [ -n "$addrs" ]; then
+        return 0
+    fi
+    ready_flags=$(oc get endpointslices -n "$ns" -l "kubernetes.io/service-name=${name}" -o jsonpath='{range .items[*].endpoints[*]}{.conditions.ready}{"\n"}{end}' 2>/dev/null || true)
+    if printf '%s\n' "$ready_flags" | grep -qx true; then
+        return 0
+    fi
+    return 1
+}
+
+rhtas_controller_deployment_ready() {
+    local dep ready want
+    dep=$(oc get deployment -n openshift-operators -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep -E 'rhtas-operator|trusted-artifact-signer' | head -1 || true)
+    [ -n "$dep" ] || return 1
+    ready=$(oc get deployment "$dep" -n openshift-operators -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
+    want=$(oc get deployment "$dep" -n openshift-operators -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 0)
+    [ -n "${ready:-}" ] && [ "${want:-0}" != "0" ] && [ "$ready" = "$want" ]
+}
+
+rhtas_operator_controller_ready() {
+    local strategy
+    if ! oc get crd securesigns.rhtas.redhat.com >/dev/null 2>&1; then
+        return 1
+    fi
+    strategy=$(oc get crd securesigns.rhtas.redhat.com -o jsonpath='{.spec.conversion.strategy}' 2>/dev/null || true)
+    if [ "$strategy" = "Webhook" ]; then
+        if rhtas_webhook_service_ready; then
             return 0
         fi
+        return 1
+    fi
+    if rhtas_controller_deployment_ready; then
+        return 0
     fi
     return 1
 }
@@ -1173,13 +1203,13 @@ DEPLOYMENT_READY=false
 CSV_SUCCEEDED=false
 
 if rhtas_operator_controller_ready; then
-    echo "✓ RHTAS operator controller is already Running — skipping CSV wait"
+    echo "✓ RHTAS operator controller is already ready (conversion webhook has endpoints) — skipping CSV wait"
     CSV_NAME=$(oc get csv -n openshift-operators -o name 2>/dev/null | grep -iE "trusted-artifact-signer|rhtas-operator" | head -1 | sed 's|.*/||' || echo "")
     DEPLOYMENT_READY=true
     CSV_SUCCEEDED=true
 else
 echo "Waiting for operator pods (CSV name is optional)..."
-MAX_WAIT_CSV=180
+MAX_WAIT_CSV="${MAX_WAIT_RHTAS_OPERATOR:-300}"
 WAIT_COUNT=0
 
 approve_rhtas_installplan_if_needed
@@ -1230,7 +1260,7 @@ if [ "$DEPLOYMENT_READY" = true ]; then
     echo "✓ RHTAS operator already ready — skipping CSV Succeeded wait"
 else
 echo "Waiting for RHTAS operator to be ready (preferring live Deployment/Pods over CSV phase alone)..."
-MAX_WAIT_CSV_INSTALL=180
+MAX_WAIT_CSV_INSTALL="${MAX_WAIT_RHTAS_OPERATOR:-300}"
 WAIT_COUNT=0
 CSV_SUCCEEDED=false
 DEPLOYMENT_READY=false
@@ -1268,10 +1298,15 @@ while [ $WAIT_COUNT -lt $MAX_WAIT_CSV_INSTALL ]; do
             DEPLOYMENT_REPLICAS=$(oc get deployment $DEPLOYMENT_NAME -n openshift-operators -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
             
             if [ "$DEPLOYMENT_READY_REPLICAS" = "$DEPLOYMENT_REPLICAS" ] && [ "$DEPLOYMENT_READY_REPLICAS" != "0" ]; then
-                DEPLOYMENT_READY=true
-                echo "✓ CSV is in Succeeded phase"
-                echo "✓ Deployment $DEPLOYMENT_NAME is ready ($DEPLOYMENT_READY_REPLICAS/$DEPLOYMENT_REPLICAS replicas)"
-                break
+                if rhtas_webhook_service_ready; then
+                    DEPLOYMENT_READY=true
+                    echo "✓ CSV is in Succeeded phase"
+                    echo "✓ Deployment $DEPLOYMENT_NAME is ready ($DEPLOYMENT_READY_REPLICAS/$DEPLOYMENT_REPLICAS replicas)"
+                    break
+                fi
+                if [ $((WAIT_COUNT % 30)) -eq 0 ] && [ $WAIT_COUNT -gt 0 ]; then
+                    echo "  Deployment $DEPLOYMENT_NAME is ready; waiting for the conversion webhook endpoints... (${WAIT_COUNT}s/${MAX_WAIT_CSV_INSTALL}s)"
+                fi
             else
                 # CSV says succeeded but deployment isn't ready yet
                 if [ $((WAIT_COUNT % 30)) -eq 0 ] && [ $WAIT_COUNT -gt 0 ]; then
@@ -1285,9 +1320,14 @@ while [ $WAIT_COUNT -lt $MAX_WAIT_CSV_INSTALL ]; do
                 fi
             fi
         else
-            # Can't find deployment, but CSV is succeeded - might be OK
-            echo "✓ CSV is in Succeeded phase (deployment name not found, will check pods)"
-            break
+            if rhtas_webhook_service_ready; then
+                DEPLOYMENT_READY=true
+                echo "✓ CSV is in Succeeded phase and the conversion webhook is ready"
+                break
+            fi
+            if [ $((WAIT_COUNT % 30)) -eq 0 ] && [ $WAIT_COUNT -gt 0 ]; then
+                echo "  CSV is Succeeded; waiting for the conversion webhook endpoints... (${WAIT_COUNT}s/${MAX_WAIT_CSV_INSTALL}s)"
+            fi
         fi
     elif [ "$CSV_PHASE" = "Failed" ]; then
         echo "Error: CSV installation failed. Phase: $CSV_PHASE"
@@ -1310,21 +1350,19 @@ while [ $WAIT_COUNT -lt $MAX_WAIT_CSV_INSTALL ]; do
     fi
 done
 
-if [ "$CSV_SUCCEEDED" = false ]; then
-    echo "Warning: CSV did not reach Succeeded phase within ${MAX_WAIT_CSV_INSTALL} seconds"
-    echo "Current CSV status:"
-    oc get csv $CSV_NAME -n openshift-operators -o yaml | grep -A 10 "status:" || echo "  Could not retrieve CSV status"
-    echo ""
-    echo "Continuing, but operator may not be fully ready..."
-elif [ "$DEPLOYMENT_READY" = false ] && [ -n "$DEPLOYMENT_NAME" ]; then
-    echo "Warning: CSV is Succeeded but deployment $DEPLOYMENT_NAME is not ready"
-    echo "Deployment status:"
-    oc get deployment $DEPLOYMENT_NAME -n openshift-operators -o yaml | grep -A 15 "status:" || echo "  Could not retrieve deployment status"
-    echo ""
-    echo "Checking deployment events:"
-    oc get events -n openshift-operators --field-selector involvedObject.name=$DEPLOYMENT_NAME --sort-by='.lastTimestamp' --no-headers 2>/dev/null | tail -5 || echo "  No recent events"
-    echo ""
-    echo "Continuing, but operator pods may not be running..."
+if [ "$CSV_SUCCEEDED" = false ] || [ "$DEPLOYMENT_READY" = false ]; then
+    if rhtas_operator_controller_ready; then
+        echo "✓ RHTAS operator controller is ready"
+        CSV_SUCCEEDED=true
+        DEPLOYMENT_READY=true
+    else
+        echo "Error: RHTAS operator controller did not become ready within ${MAX_WAIT_CSV_INSTALL}s."
+        echo "Securesign v1alpha1 is created through the operator conversion webhook. That call fails with"
+        echo "'no endpoints available' while the CSV is still InstallReady and the controller pod is not Ready."
+        echo "  CSV: ${CSV_NAME:-unknown} phase: $(oc get csv $CSV_NAME -n openshift-operators -o jsonpath='{.status.phase}' 2>/dev/null || echo unknown)"
+        oc get csv,deploy,pods,endpoints -n openshift-operators 2>/dev/null | grep -iE 'rhtas|trusted-artifact' || echo "  No RHTAS workloads found in openshift-operators"
+        exit 1
+    fi
 fi
 fi
 
@@ -1386,7 +1424,7 @@ echo "Waiting for RHTAS operator pods to be running..."
 
 # Find deployment name if not already found
 if [ -z "$DEPLOYMENT_NAME" ]; then
-    DEPLOYMENT_NAME=$(oc get deployment -n openshift-operators -o name 2>/dev/null | grep -i "rhtas\|trusted-artifact-signer\|controller-manager" | head -1 | sed 's|deployment.apps/||' || echo "")
+    DEPLOYMENT_NAME=$(oc get deployment -n openshift-operators -o name 2>/dev/null | grep -iE "rhtas-operator|trusted-artifact-signer" | head -1 | sed 's|deployment.apps/||' || echo "")
     if [ -z "$DEPLOYMENT_NAME" ]; then
         # Try to get from CSV
         DEPLOYMENT_NAME=$(oc get csv $CSV_NAME -n openshift-operators -o jsonpath='{.spec.install.spec.deployments[*].name}' 2>/dev/null | awk '{print $1}' || echo "")
@@ -1517,7 +1555,8 @@ if [ "$OPERATOR_PODS_READY" = false ]; then
     echo "  oc get events -n openshift-operators --sort-by='.lastTimestamp' | grep -i 'trusted\|rhtas' | tail -20"
     echo "  oc logs -n openshift-operators -l name=trusted-artifact-signer-operator --tail=50"
     echo ""
-    echo "This may cause issues when deploying RHTAS components. Continuing anyway..."
+    echo "Error: RHTAS operator pods are not ready. Refusing to deploy Securesign until the conversion webhook has endpoints."
+    exit 1
 fi
 
 fi

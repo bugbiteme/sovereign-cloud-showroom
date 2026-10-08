@@ -120,7 +120,124 @@ rhtas_operator_labeled_pods() {
 # Fallback when label does not match (e.g. controller or client-server components in the stack namespace)
 rhtas_controller_pods_fallback() {
     local ns=$1
-    oc get pods -n "$ns" --no-headers 2>/dev/null | grep -iE 'trusted-artifact-signer.*(operator|controller)|rhtas.*(operator|controller)|controller-manager|^cli-server-' | wc -l | tr -d ' '
+    { oc get pods -n "$ns" --no-headers 2>/dev/null || true; } \
+        | { grep -iE 'trusted-artifact-signer.*(operator|controller)|rhtas-operator|rhtas.*controller' || true; } \
+        | wc -l | tr -d ' '
+}
+
+# v1alpha1 Securesign writes go through the operator conversion webhook.
+# Ready means that service has addresses, not merely that some pod is Running.
+rhtas_webhook_service_ready() {
+    local strategy ns name addrs ready_flags
+    if ! oc get crd securesigns.rhtas.redhat.com >/dev/null 2>&1; then
+        return 1
+    fi
+    strategy=$(oc get crd securesigns.rhtas.redhat.com -o jsonpath='{.spec.conversion.strategy}' 2>/dev/null || true)
+    if [ "$strategy" != "Webhook" ]; then
+        return 0
+    fi
+    ns=$(oc get crd securesigns.rhtas.redhat.com -o jsonpath='{.spec.conversion.webhook.clientConfig.service.namespace}' 2>/dev/null || true)
+    name=$(oc get crd securesigns.rhtas.redhat.com -o jsonpath='{.spec.conversion.webhook.clientConfig.service.name}' 2>/dev/null || true)
+    if [ -z "$ns" ] || [ -z "$name" ]; then
+        return 1
+    fi
+    addrs=$(oc get endpoints "$name" -n "$ns" -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)
+    if [ -n "$addrs" ]; then
+        return 0
+    fi
+    ready_flags=$(oc get endpointslices -n "$ns" -l "kubernetes.io/service-name=${name}" -o jsonpath='{range .items[*].endpoints[*]}{.conditions.ready}{"\n"}{end}' 2>/dev/null || true)
+    if printf '%s\n' "$ready_flags" | grep -qx true; then
+        return 0
+    fi
+    return 1
+}
+
+rhtas_controller_deployment_ready() {
+    local dep ready want
+    dep=$(oc get deployment -n openshift-operators -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep -E 'rhtas-operator|trusted-artifact-signer' | head -1 || true)
+    [ -n "$dep" ] || return 1
+    ready=$(oc get deployment "$dep" -n openshift-operators -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
+    want=$(oc get deployment "$dep" -n openshift-operators -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 0)
+    [ -n "${ready:-}" ] && [ "${want:-0}" != "0" ] && [ "$ready" = "$want" ]
+}
+
+rhtas_operator_controller_ready() {
+    local strategy
+    if ! oc get crd securesigns.rhtas.redhat.com >/dev/null 2>&1; then
+        return 1
+    fi
+    strategy=$(oc get crd securesigns.rhtas.redhat.com -o jsonpath='{.spec.conversion.strategy}' 2>/dev/null || true)
+    if [ "$strategy" = "Webhook" ]; then
+        if rhtas_webhook_service_ready; then
+            return 0
+        fi
+        return 1
+    fi
+    if rhtas_controller_deployment_ready; then
+        return 0
+    fi
+    return 1
+}
+
+approve_rhtas_installplan_if_needed() {
+    local ip approved
+    ip=$(oc get subscription.operators.coreos.com trusted-artifact-signer -n openshift-operators -o jsonpath='{.status.installPlanRef.name}' 2>/dev/null || true)
+    [ -z "$ip" ] && return 0
+    approved=$(oc get installplan.operators.coreos.com "$ip" -n openshift-operators -o jsonpath='{.spec.approved}' 2>/dev/null || echo "false")
+    if [ "$approved" != "true" ]; then
+        warning "Approving InstallPlan '${ip}' so the RHTAS operator can finish installing..."
+        oc patch installplan.operators.coreos.com "$ip" -n openshift-operators --type merge -p '{"spec":{"approved":true}}' >/dev/null 2>&1 || \
+            oc patch installplan "$ip" -n openshift-operators --type merge -p '{"spec":{"approved":true}}' >/dev/null 2>&1 || true
+    fi
+}
+
+wait_for_rhtas_operator() {
+    local max="${MAX_WAIT_RHTAS_OPERATOR:-300}"
+    local w=0 phase
+    if rhtas_operator_controller_ready; then
+        log "✓ RHTAS operator controller is ready"
+        return 0
+    fi
+    log "Waiting for the RHTAS operator conversion webhook to have endpoints (max ${max}s)..."
+    while [ "$w" -lt "$max" ]; do
+        approve_rhtas_installplan_if_needed
+        if rhtas_operator_controller_ready; then
+            log "✓ RHTAS operator controller is ready"
+            return 0
+        fi
+        sleep 5
+        w=$((w + 5))
+        if [ $((w % 30)) -eq 0 ]; then
+            phase=$(oc get csv -n openshift-operators -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.phase}{"\n"}{end}' 2>/dev/null | grep -iE 'rhtas|trusted-artifact-signer' | head -1 || true)
+            info "  Still waiting for RHTAS operator... (${w}s/${max}s) ${phase:-CSV not listed yet}"
+        fi
+    done
+    error "RHTAS operator controller did not become ready within ${max}s. Securesign v1alpha1 needs the conversion webhook (no endpoints while the CSV is still InstallReady). Check: oc get csv,deploy,pods,endpoints -n openshift-operators | grep -iE 'rhtas|trusted-artifact'"
+}
+
+# Retry only the webhook race. Other apply errors fail immediately.
+oc_apply_retry() {
+    local manifest attempt=0 max=12 errfile
+    manifest=$(cat)
+    errfile=$(mktemp)
+    while [ "$attempt" -lt "$max" ]; do
+        if printf '%s\n' "$manifest" | oc apply -f - 2>"$errfile"; then
+            rm -f "$errfile"
+            return 0
+        fi
+        if grep -qE 'no endpoints available|conversion webhook' "$errfile"; then
+            warning "RHTAS conversion webhook has no endpoints yet; retrying ($((attempt + 1))/${max})..."
+            sleep 10
+            attempt=$((attempt + 1))
+            continue
+        fi
+        cat "$errfile" >&2 || true
+        rm -f "$errfile"
+        return 1
+    done
+    cat "$errfile" >&2 || true
+    rm -f "$errfile"
+    return 1
 }
 
 # First namespace (among openshift-operators and target ns) that has any operator/controller signal; prints ns name or empty
@@ -162,14 +279,15 @@ fi
 if [ -z "$CSV_NAME" ]; then
     error "RHTAS Operator CSV not found. Please install it first by running: ./02-operator.sh"
 fi
+CSV_NAME="${CSV_NAME%% *}"
 
-# Check CSV phase
-CSV_PHASE=$(oc get csv $CSV_NAME -n openshift-operators -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-if [ "$CSV_PHASE" != "Succeeded" ]; then
-    warning "RHTAS Operator CSV is not in Succeeded phase. Current phase: ${CSV_PHASE:-Unknown}"
-    warning "The operator may not be fully installed. Continuing anyway..."
-else
+# InstallReady means the controller pod is not serving the conversion webhook yet.
+wait_for_rhtas_operator
+CSV_PHASE=$(oc get csv "$CSV_NAME" -n openshift-operators -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+if [ "$CSV_PHASE" = "Succeeded" ]; then
     log "✓ RHTAS Operator CSV is in Succeeded phase"
+else
+    log "✓ RHTAS operator webhook is ready (CSV phase: ${CSV_PHASE:-unknown})"
 fi
 
 # Check if CRDs are installed
@@ -197,8 +315,7 @@ log "✓ All required CRDs are installed"
 # Check if operator/controller pods are running (OLM uses openshift-operators; some installs also show controllers in the stack namespace)
 OPERATOR_NS=$(rhtas_operator_namespace_detect)
 if [ -z "$OPERATOR_NS" ]; then
-    warning "No RHTAS operator/controller pods found in openshift-operators or ${RHTAS_TARGET_NAMESPACE} (label name=trusted-artifact-signer-operator, or controller name pattern)."
-    warning "The operator may not be functioning correctly. Continuing anyway..."
+    log "✓ RHTAS conversion webhook is ready (controller pod label differs from name=trusted-artifact-signer-operator)"
 else
     READY_PODS=$(oc get pods -n "$OPERATOR_NS" -l name=trusted-artifact-signer-operator --field-selector=status.phase=Running -o jsonpath='{.items[?(@.status.containerStatuses[0].ready==true)].metadata.name}' 2>/dev/null | wc -w | tr -d ' ')
     if [ "${READY_PODS:-0}" -gt 0 ]; then
@@ -277,7 +394,7 @@ if oc get crd securesigns.rhtas.redhat.com >/dev/null 2>&1; then
         log "✓ Securesign CR '${SECURESIGN_NAME}' already exists"
     else
         log "Creating Securesign CR..."
-        if ! cat <<EOF | oc apply -f -
+        if ! cat <<EOF | oc_apply_retry
 apiVersion: ${RHTAS_API_VERSION}
 kind: Securesign
 metadata:
@@ -369,7 +486,7 @@ else
     if oc get tufs $TUF_NAME -n $RHTAS_NAMESPACE >/dev/null 2>&1; then
         log "✓ TUF CR '${TUF_NAME}' already exists"
     else
-        if ! cat <<EOF | oc apply -f -
+        if ! cat <<EOF | oc_apply_retry
 apiVersion: ${RHTAS_API_VERSION}
 kind: Tuf
 metadata:
@@ -400,7 +517,7 @@ EOF
     if oc get fulcios $FULCIO_NAME -n $RHTAS_NAMESPACE >/dev/null 2>&1; then
         log "✓ Fulcio CR '${FULCIO_NAME}' already exists"
     else
-        if ! cat <<EOF | oc apply -f -
+        if ! cat <<EOF | oc_apply_retry
 apiVersion: ${RHTAS_API_VERSION}
 kind: Fulcio
 metadata:
@@ -425,7 +542,7 @@ EOF
     if oc get rekors $REKOR_NAME -n $RHTAS_NAMESPACE >/dev/null 2>&1; then
         log "✓ Rekor CR '${REKOR_NAME}' already exists"
     else
-        if ! cat <<EOF | oc apply -f -
+        if ! cat <<EOF | oc_apply_retry
 apiVersion: ${RHTAS_API_VERSION}
 kind: Rekor
 metadata:
